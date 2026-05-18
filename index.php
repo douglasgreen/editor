@@ -68,11 +68,6 @@
                 }
             }
 
-            // Provide a welcome text for the first page if empty
-            if (!contentByIndex[1]) {
-                contentByIndex[1] = "# New Document\n\nStart typing your Markdown here.";
-            }
-
             renderPagination();
             loadPage(currentIndex);
         });
