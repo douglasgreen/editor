@@ -25,11 +25,6 @@ function readCsv($filepath) {
                     $index = intval($data[0]);
                     $timestamp = $data[1];
                     $content = $data[2];
-                } elseif ($count >= 2) {
-                    // Legacy format: timestamp, content
-                    $index = 1;
-                    $timestamp = $data[0];
-                    $content = $data[1];
                 } else {
                     continue;
                 }
