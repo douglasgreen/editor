@@ -57,47 +57,60 @@ function writeCsv($filepath, $rows) {
     return false;
 }
 
+/**
+ * Helper function to filter rows to keep only the last 10 versions per index.
+ * Returns an array of rows sorted by index and timestamp descending.
+ */
+function filterRows($rows) {
+    $versionsPerIndex = [];
+    foreach ($rows as $row) {
+        $index = intval($row[0]);
+        if ($index < 1 || $index > 10) {
+            continue;
+        }
+        $versionsPerIndex[$index][] = $row;
+    }
+
+    $filteredRows = [];
+    foreach ($versionsPerIndex as $index => $indexRows) {
+        // Sort by timestamp descending
+        usort($indexRows, function($a, $b) {
+            return strtotime($b[1]) - strtotime($a[1]);
+        });
+        // Keep only the first 10 (most recent)
+        $filteredRows = array_merge($filteredRows, array_slice($indexRows, 0, 10));
+    }
+    return $filteredRows;
+}
+
 // --- MAIN LOGIC ---
 
 // 1. Load current data
 $rows = readCsv($csvFile);
 
-// 2. DATA CLEANUP
-// Delete any entries older than 3 days.
-$cutoffDate = strtotime('-3 days');
+// 2. DATA CLEANUP & ORGANIZATION
+// Keep the last 10 versions of content for each index (1-10).
+$filteredRows = filterRows($rows);
 
-// Build per-index latest list, ignoring rows that are too old
-$rowsPerIndex = [];
-foreach ($rows as $row) {
+// Find the most recent content for each index
+$latestPerIndex = [];
+foreach ($filteredRows as $row) {
     $index = intval($row[0]);
-    // Only accept indices 1‑10
-    if ($index < 1 || $index > 10) {
-        continue;
-    }
-    $timestamp = $row[1];
-    // Skip rows older than cutoff
-    if (strtotime($timestamp) <= $cutoffDate) {
-        continue;
-    }
-    // Keep the most recent row for this index
-    if (!isset($rowsPerIndex[$index]) || strtotime($timestamp) > strtotime($rowsPerIndex[$index][1])) {
-        $rowsPerIndex[$index] = [$index, $timestamp, $row[2]];
+    if (!isset($latestPerIndex[$index])) {
+        $latestPerIndex[$index] = $row; // The first one we encounter is the most recent due to sorting
     }
 }
-
-// Flag to determine if we need to write to disk at the end
-$needsSave = true; // always write the cleaned list back
 
 // --- HANDLE REQUESTS ---
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
     // Write the cleaned version back so the file stays tidy
-    writeCsv($csvFile, array_values($rowsPerIndex));
+    writeCsv($csvFile, array_values($filteredRows));
 
     // --- LOAD ALL CURRENT CONTENT AS JSON ---
     $output = [];
-    foreach ($rowsPerIndex as $index => $entry) {
+    foreach ($latestPerIndex as $index => $entry) {
         $output[] = [
             'index' => $entry[0],
             'timestamp' => $entry[1],
@@ -123,24 +136,12 @@ if ($method === 'GET') {
     // Reload from disk to pick up any concurrent modifications
     $currentRows = readCsv($csvFile);
 
-    // Remove any existing row with the same index (we will replace it)
-    $newRows = [];
-    foreach ($currentRows as $row) {
-        $rowIndex = intval($row[0]);
-        $rowTimestamp = $row[1];
-        if ($rowIndex == $index) {
-            continue; // skip this one, we will add a fresh row
-        }
-        // Also skip rows that are too old
-        if (strtotime($rowTimestamp) <= $cutoffDate) {
-            continue;
-        }
-        $newRows[] = [$rowIndex, $rowTimestamp, $row[2]];
-    }
-
     // Append the new row
     $timestamp = date('Y-m-d H:i:s');
-    $newRows[] = [$index, $timestamp, $content];
+    $currentRows[] = [$index, $timestamp, $content];
+
+    // Filter to keep only the last 10 versions per index
+    $newRows = filterRows($currentRows);
 
     // Write everything back to the file
     if (writeCsv($csvFile, array_values($newRows))) {

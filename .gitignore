@@ -1,3 +1,4 @@
 data.csv
 vendor
 composer.lock
+.cecli*
