@@ -1,122 +1,59 @@
 <?php
 // --- CONFIGURATION ---
-// Store data in a CSV file in the current directory
-$csvFile = __DIR__ . '/data.csv';
+$configFile = __DIR__ . '/config/config.ini';
+if (!file_exists($configFile)) {
+    throw new RuntimeException('Config file not found. Please create config/config.ini from config.ini.sample');
+}
+
+$config = parse_ini_file($configFile, true);
+if ($config === false) {
+    throw new RuntimeException('Error parsing config file.');
+}
+
+$connection = $config['connection'] ?? [];
+$host = $connection['host'] ?? '';
+$port = (int) ($connection['port'] ?? 3306);
+$database = $connection['db'] ?? '';
+$user = $connection['user'] ?? '';
+$password = $connection['pass'] ?? '';
+
+if ($host === '~' || $database === '~' || $user === '~' || $password === '~' || $host === '' || $database === '' || $user === '' || $password === '') {
+    throw new RuntimeException('Config not set up. Please update config.ini');
+}
+
+$dsn = sprintf('mysql:host=%s;port=%d;dbname=%s;charset=utf8mb4', $host, $port, $database);
+$pdo = new PDO($dsn, $user, $password);
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
 // Set timezone to ensure date calculations are consistent
 date_default_timezone_set('UTC');
-
-/**
- * Helper function to read all rows from the CSV safely.
- * Returns an array of rows where each row is [index, timestamp, content].
- * Legacy rows (two fields) will be interpreted as index 1.
- */
-function readCsv($filepath) {
-    if (!file_exists($filepath)) {
-        return [];
-    }
-    $rows = [];
-    $handle = fopen($filepath, 'r');
-    if ($handle) {
-        // Shared lock for reading
-        if (flock($handle, LOCK_SH)) {
-            while (($data = fgetcsv($handle)) !== FALSE) {
-                $count = count($data);
-                if ($count >= 3) {
-                    $index = intval($data[0]);
-                    $timestamp = $data[1];
-                    $content = $data[2];
-                } else {
-                    continue;
-                }
-                $rows[] = [$index, $timestamp, $content];
-            }
-            flock($handle, LOCK_UN);
-        }
-        fclose($handle);
-    }
-    return $rows;
-}
-
-/**
- * Helper function to write rows to the CSV safely.
- * Each row is an array [index, timestamp, content].
- */
-function writeCsv($filepath, $rows) {
-    $handle = fopen($filepath, 'w'); // 'w' truncates the file
-    if ($handle) {
-        // Exclusive lock for writing
-        if (flock($handle, LOCK_EX)) {
-            foreach ($rows as $row) {
-                fputcsv($handle, $row);
-            }
-            flock($handle, LOCK_UN);
-        }
-        fclose($handle);
-        return true;
-    }
-    return false;
-}
-
-/**
- * Helper function to filter rows to keep only the last 10 versions per index.
- * Returns an array of rows sorted by index and timestamp descending.
- */
-function filterRows($rows) {
-    $versionsPerIndex = [];
-    foreach ($rows as $row) {
-        $index = intval($row[0]);
-        if ($index < 1 || $index > 10) {
-            continue;
-        }
-        $versionsPerIndex[$index][] = $row;
-    }
-
-    $filteredRows = [];
-    foreach ($versionsPerIndex as $index => $indexRows) {
-        // Sort by timestamp descending
-        usort($indexRows, function($a, $b) {
-            return strtotime($b[1]) - strtotime($a[1]);
-        });
-        // Keep only the first 10 (most recent)
-        $filteredRows = array_merge($filteredRows, array_slice($indexRows, 0, 10));
-    }
-    return $filteredRows;
-}
-
-// --- MAIN LOGIC ---
-
-// 1. Load current data
-$rows = readCsv($csvFile);
-
-// 2. DATA CLEANUP & ORGANIZATION
-// Keep the last 10 versions of content for each index (1-10).
-$filteredRows = filterRows($rows);
-
-// Find the most recent content for each index
-$latestPerIndex = [];
-foreach ($filteredRows as $row) {
-    $index = intval($row[0]);
-    if (!isset($latestPerIndex[$index])) {
-        $latestPerIndex[$index] = $row; // The first one we encounter is the most recent due to sorting
-    }
-}
 
 // --- HANDLE REQUESTS ---
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
-    // Write the cleaned version back so the file stays tidy
-    writeCsv($csvFile, array_values($filteredRows));
-
     // --- LOAD ALL CURRENT CONTENT AS JSON ---
+    $stmt = $pdo->query("
+        WITH RankedVersions AS (
+            SELECT page_index, content, created_at,
+                   ROW_NUMBER() OVER (PARTITION BY page_index ORDER BY created_at DESC) as rn
+            FROM document_version
+        )
+        SELECT page_index, content, created_at
+        FROM RankedVersions
+        WHERE rn = 1
+        ORDER BY page_index
+    ");
+
     $output = [];
-    foreach ($latestPerIndex as $index => $entry) {
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $output[] = [
-            'index' => $entry[0],
-            'timestamp' => $entry[1],
-            'content' => $entry[2]
+            'index' => (int)$row['page_index'],
+            'timestamp' => $row['created_at'],
+            'content' => $row['content']
         ];
     }
+
     // Ensure consistent JSON headers
     header('Content-Type: application/json');
     echo json_encode($output);
@@ -133,22 +70,26 @@ if ($method === 'GET') {
         exit;
     }
 
-    // Reload from disk to pick up any concurrent modifications
-    $currentRows = readCsv($csvFile);
+    // Insert the new version
+    $stmt = $pdo->prepare("INSERT INTO document_version (page_index, content) VALUES (:index, :content)");
+    $stmt->execute([':index' => $index, ':content' => $content]);
 
-    // Append the new row
-    $timestamp = date('Y-m-d H:i:s');
-    $currentRows[] = [$index, $timestamp, $content];
+    // Cleanup old versions (keep last 10)
+    $cleanupStmt = $pdo->prepare("
+        DELETE FROM document_version
+        WHERE page_index = :index
+        AND document_version_id NOT IN (
+            SELECT document_version_id FROM (
+                SELECT document_version_id
+                FROM document_version
+                WHERE page_index = :index
+                ORDER BY created_at DESC
+                LIMIT 10
+            ) AS t
+        )
+    ");
+    $cleanupStmt->execute([':index' => $index]);
 
-    // Filter to keep only the last 10 versions per index
-    $newRows = filterRows($currentRows);
-
-    // Write everything back to the file
-    if (writeCsv($csvFile, array_values($newRows))) {
-        echo "Content saved successfully.";
-    } else {
-        http_response_code(500);
-        echo "Error: Could not write to data file. Check permissions.";
-    }
+    echo "Content saved successfully.";
 }
 ?>

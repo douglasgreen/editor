@@ -1,0 +1,6 @@
+[connection]
+host = "localhost"
+port = 3306
+db = "markdown_editor"
+user = "root"
+pass = "password"
