@@ -33,16 +33,16 @@ $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
     // --- LOAD ALL CURRENT CONTENT AS JSON ---
+    // Rewritten for MySQL 5.7 to avoid CTEs and Window Functions
     $stmt = $pdo->query("
-        WITH RankedVersions AS (
-            SELECT page_index, content, created_at,
-                   ROW_NUMBER() OVER (PARTITION BY page_index ORDER BY created_at DESC) as rn
+        SELECT dv.page_index, dv.content, dv.created_at
+        FROM document_version dv
+        INNER JOIN (
+            SELECT page_index, MAX(document_version_id) AS max_id
             FROM document_version
-        )
-        SELECT page_index, content, created_at
-        FROM RankedVersions
-        WHERE rn = 1
-        ORDER BY page_index
+            GROUP BY page_index
+        ) latest ON dv.document_version_id = latest.max_id
+        ORDER BY dv.page_index
     ");
 
     $output = [];
@@ -75,6 +75,7 @@ if ($method === 'GET') {
     $stmt->execute([':index' => $index, ':content' => $content]);
 
     // Cleanup old versions (keep last 10)
+    // Modified PDO placeholders to be unique, ensuring safety when PDO Emulate Prepares is disabled
     $cleanupStmt = $pdo->prepare("
         DELETE FROM document_version
         WHERE page_index = :index
@@ -82,13 +83,16 @@ if ($method === 'GET') {
             SELECT document_version_id FROM (
                 SELECT document_version_id
                 FROM document_version
-                WHERE page_index = :index
-                ORDER BY created_at DESC
+                WHERE page_index = :index_select
+                ORDER BY created_at DESC, document_version_id DESC
                 LIMIT 10
             ) AS t
         )
     ");
-    $cleanupStmt->execute([':index' => $index]);
+    $cleanupStmt->execute([
+        ':index' => $index,
+        ':index_select' => $index
+    ]);
 
     echo "Content saved successfully.";
 }
